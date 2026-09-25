@@ -3,12 +3,15 @@
  * 构造前做领域校验，不合法则抛 DomainError（携带全部错误信息）。
  */
 import { validateRound, validateSchemePayload } from './validate.js';
+// 与 replay.js 互相引用：ESM 活动绑定保证此处取到运行时的重放函数。
+import { replayWithCorrections } from './replay.js';
 
 export const EVENT_TYPES = Object.freeze({
   SCHEME_CREATED: 'scheme-created',
   ROUND_SUBMITTED: 'round-submitted',
   LIQUID_CHANGED: 'liquid-changed',
   ARTIFACT_REMOVED: 'artifact-removed',
+  ROUND_CORRECTED: 'round-corrected',
 });
 
 export class DomainError extends Error {
@@ -78,4 +81,38 @@ export function buildRemovalEvent(tank, artifactId) {
     throw new DomainError(`器物「${artifact.name}」尚未连续达到规定轮数（或末值高于上限），不能出槽`);
   }
   return { type: EVENT_TYPES.ARTIFACT_REMOVED, tankId: tank.id, artifactId };
+}
+
+/**
+ * 对一轮已提交读数提出追溯补正（原记录保留，补正以追加事件形式存在）。
+ * 约束：
+ * - target 为原轮的 round-submitted 事件（按 seq 定位）；
+ * - 器物集合与采样时刻完全沿用原轮，提交者只能按原轮位置给出非负整数读数；
+ * - 同一原轮至多有一条有效补正（重复补正被拒绝）。
+ *
+ * 重放校验由 replay.js 的 replayWithCorrections 完成：
+ * 把替代读数叠入原轮位置后自首项记录重放，原轮之后的每次读数、换液、出槽
+ * 都必须仍符合既有规则，否则抛 DomainError 并在 errors[0] 给出最早受影响事件及原因。
+ *
+ * @param {Array<object>} events 已追加的事件日志（含 seq）
+ * @param {number} targetSeq 原轮事件的 seq
+ * @param {Array<{artifactId:string, value:number}>} replacements 按原轮位置给出的替代读数（不含 ts）
+ */
+export function buildRoundCorrectionEvent(events, targetSeq, replacements) {
+  const result = replayWithCorrections(events, [{ targetSeq, replacements }]);
+  if (result.error) {
+    throw new DomainError(result.error.message, [result.error.message]);
+  }
+  const original = events.find((e) => e.seq === targetSeq);
+  return {
+    type: EVENT_TYPES.ROUND_CORRECTED,
+    tankId: original.tankId,
+    targetSeq,
+    // 器物集合与采样时刻完全保持不变，仅替换每件器物的非负整数读数。
+    readings: original.readings.map((r, i) => ({
+      artifactId: r.artifactId,
+      value: result.corrections[0].values[i],
+      ts: r.ts,
+    })),
+  };
 }

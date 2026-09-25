@@ -189,6 +189,37 @@ button.primary:hover:not(:disabled) { background: var(--accent-dark); }
 ol.log { margin: 8px 0 0; padding-left: 22px; font-size: 14px; }
 ol.log li { margin: 6px 0; }
 
+.log-round .correction-line { margin: 2px 0 0 8px; font-size: 13px; }
+.link-btn {
+  border: none;
+  background: none;
+  color: var(--accent);
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.link-btn:hover { color: var(--accent-dark); background: none; }
+.superseded { color: var(--muted); text-decoration: line-through; }
+.corrected { color: var(--accent-dark); font-weight: 600; }
+.correction-line { font-size: 13px; }
+.correction-form {
+  margin: 6px 0 4px 18px;
+  padding: 10px 14px;
+  border: 1px dashed var(--accent);
+  border-radius: 8px;
+  background: #f6faf9;
+}
+.correction-form h4 { margin-top: 4px; }
+.correction-form .reading-row { grid-template-columns: 140px 1fr 220px; }
+.correction-row label input:disabled { background: #f1efe8; color: var(--muted); }
+
+ol.log li.flash { border-radius: 6px; animation: log-flash 1.6s ease-out; }
+@keyframes log-flash {
+  0% { background: #dff0ee; }
+  100% { background: transparent; }
+}
+
 .toast {
   position: fixed;
   left: 50%;

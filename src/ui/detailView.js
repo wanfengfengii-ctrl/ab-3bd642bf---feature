@@ -3,6 +3,7 @@ import {
   buildRoundEvent,
   buildLiquidChangeEvent,
   buildRemovalEvent,
+  buildRoundCorrectionEvent,
   DomainError,
   EVENT_TYPES,
 } from '../domain/events.js';
@@ -23,6 +24,11 @@ export function renderDetail(ctx, schemeId, options = {}) {
   }
   const state = replayScheme(record.events);
   const tanks = state.tanks.map(deriveTank);
+  const correctionByTarget = new Map(
+    record.events
+      .filter((ev) => ev.type === EVENT_TYPES.ROUND_CORRECTED)
+      .map((ev) => [ev.targetSeq, ev]),
+  );
 
   root.innerHTML = `
     <section class="panel scheme-head">
@@ -37,7 +43,8 @@ export function renderDetail(ctx, schemeId, options = {}) {
     ${tanks.map((tank) => tankCardHtml(tank)).join('')}
     <section class="panel">
       <h3>过程记录（自首项记录重放 · 不可改写）</h3>
-      <ol class="log">${record.events.map((ev) => `<li>${renderEvent(ev, state)}</li>`).join('')}</ol>
+      <p class="muted">已提交轮次若读数被抄错，可对该轮提出追溯补正：器物集合与采样时刻不变，仅替换每件器物的非负整数读数；补正后已执行的换液、出槽必须仍成立，否则拒绝写入。原读数与补正均完整保留。</p>
+      <ol class="log">${record.events.map((ev) => `<li id="log-event-${ev.seq}">${renderEvent(ev, state, correctionByTarget)}</li>`).join('')}</ol>
     </section>`;
 
   bindDetail(ctx, record, tanks);
@@ -62,7 +69,9 @@ function tankCardHtml(tank) {
 
 function artifactRowHtml(tank, a) {
   const trend = a.periodReadings.length > 0
-    ? a.periodReadings.map((r) => r.value).join(' → ')
+    ? a.periodReadings.map((r) => (r.corrected
+      ? `<span class="corrected" title="追溯补正后读数，原读数 ${r.originalValue}">${r.value}＊</span>`
+      : String(r.value))).join(' → ')
     : '—';
   const lastOk = a.lastValue != null && a.lastValue <= tank.limit;
   return `<tr>
@@ -133,7 +142,7 @@ function roundFormHtml(tank) {
   </form>`;
 }
 
-function renderEvent(ev, state) {
+function renderEvent(ev, state, correctionByTarget) {
   const time = fmtTs(Date.parse(ev.at));
   switch (ev.type) {
     case EVENT_TYPES.SCHEME_CREATED: {
@@ -146,10 +155,31 @@ function renderEvent(ev, state) {
         const found = tank && tank.artifacts.find((a) => a.id === id);
         return found ? found.name : id;
       };
+      const correction = correctionByTarget.get(ev.seq);
+      const correctedMap = correction
+        ? new Map(correction.readings.map((r) => [r.artifactId, r.value]))
+        : null;
       const readings = ev.readings
-        .map((r) => `${esc(nameOf(r.artifactId))}=${r.value} µS/cm @ ${fmtTs(r.ts)}`)
+        .map((r) => {
+          const text = `${esc(nameOf(r.artifactId))}=${r.value} µS/cm @ ${fmtTs(r.ts)}`;
+          if (correctedMap && correctedMap.has(r.artifactId)) {
+            return `<span class="superseded" title="已被 #${correction.seq} 条追溯补正替代">${text}</span>`;
+          }
+          return text;
+        })
         .join('，');
-      return `<strong>#${ev.seq}</strong> <span class="muted">${time}</span> 槽「${esc(tank ? tank.name : ev.tankId)}」第 ${ev.period + 1} 周期第 ${ev.roundInPeriod} 轮读数：${readings}`;
+      const correctionLine = correction
+        ? `<div class="correction-line">↳ 已由 <button type="button" class="link-btn" data-jump-seq="${correction.seq}">#${correction.seq} 追溯补正</button>替代（器物与采样时刻不变，当前趋势以补正后读数为准）</div>`
+        : `<div class="correction-line"><button type="button" class="link-btn" data-action="correct" data-target-seq="${ev.seq}">对该轮提出追溯补正</button></div>`;
+      return `<div class="log-round"><strong>#${ev.seq}</strong> <span class="muted">${time}</span> 槽「${esc(tank ? tank.name : ev.tankId)}」第 ${ev.period + 1} 周期第 ${ev.roundInPeriod} 轮读数：${readings}${correctionLine}</div>`;
+    }
+    case EVENT_TYPES.ROUND_CORRECTED: {
+      const tank = state.tanks.find((t) => t.id === ev.tankId);
+      const nameOf = (id) => {
+        const found = tank && tank.artifacts.find((a) => a.id === id);
+        return found ? found.name : id;
+      };
+      return `<strong>#${ev.seq}</strong> <span class="muted">${time}</span> 对槽「${esc(tank ? tank.name : ev.tankId)}」第 #${ev.targetSeq} 轮读数的追溯补正（器物集合与采样时刻不变）：${ev.readings.map((r) => `${esc(nameOf(r.artifactId))}=<strong>${r.value}</strong> µS/cm`).join('，')}；替代读数已按原轮位置叠入重放`;
     }
     case EVENT_TYPES.LIQUID_CHANGED: {
       const tank = state.tanks.find((t) => t.id === ev.tankId);
@@ -206,6 +236,96 @@ function bindDetail(ctx, record, tanks) {
       const tank = tankById.get(btn.dataset.tank);
       await mutate(ctx, record, () => buildRemovalEvent(tank, btn.dataset.artifact), '器物已出槽');
     });
+  });
+
+  root.querySelectorAll('button[data-action="correct"]').forEach((btn) => {
+    btn.addEventListener('click', () => openCorrectionForm(ctx, record, btn));
+  });
+
+  root.querySelectorAll('button[data-jump-seq]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const target = root.querySelector(`#log-event-${Number(btn.dataset.jumpSeq)}`);
+      if (target) {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.add('flash');
+        setTimeout(() => target.classList.remove('flash'), 1600);
+      }
+    });
+  });
+}
+
+/**
+ * 在过程记录中原轮下方展开追溯补正表单：
+ * 每行固定器物与采样时刻（只读），只能改读数；提交前按原轮位置构造替代读数。
+ */
+function openCorrectionForm(ctx, record, btn) {
+  const targetSeq = Number(btn.dataset.targetSeq);
+  const original = record.events.find((e) => e.seq === targetSeq);
+  const state = replayScheme(record.events);
+  const tank = state.tanks.find((t) => t.id === original.tankId);
+  const nameOf = (id) => {
+    const found = tank && tank.artifacts.find((a) => a.id === id);
+    return found ? found.name : id;
+  };
+  const rows = original.readings.map((r) => `
+    <div class="reading-row correction-row" data-artifact="${esc(r.artifactId)}">
+      <span class="reading-name">${esc(nameOf(r.artifactId))}</span>
+      <label>替代读数（整数 µS/cm）
+        <input type="number" min="0" step="1" required data-field="value" value="${r.value}">
+      </label>
+      <label>采样时间（不可修改）
+        <input type="text" disabled value="${fmtTs(r.ts)}">
+      </label>
+    </div>`).join('');
+  const wrapper = document.createElement('form');
+  wrapper.className = 'correction-form';
+  wrapper.innerHTML = `
+    <h4>对第 #${targetSeq} 轮读数提出追溯补正</h4>
+    <p class="muted">器物集合与采样时刻必须完全保持不变，仅可替换每件器物的非负整数读数。提交后将自首项记录重放，重新验证其后的每次读数、换液与出槽；若既有处置失去依据将拒绝写入并告知最早受影响记录。</p>
+    ${rows}
+    <div class="errors" hidden></div>
+    <div class="actions">
+      <button type="submit" class="primary">提交追溯补正</button>
+      <button type="button" data-action="cancel-correction">取消</button>
+    </div>`;
+  btn.closest('.correction-line').replaceWith(wrapper);
+
+  wrapper.querySelector('[data-action="cancel-correction"]').addEventListener('click', () => {
+    renderDetail(ctx, record.id);
+  });
+
+  wrapper.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const errBox = wrapper.querySelector('.errors');
+    const replacements = original.readings.map((r, i) => {
+      const row = wrapper.querySelectorAll('.reading-row')[i];
+      const raw = row.querySelector('[data-field="value"]').value;
+      return { artifactId: r.artifactId, value: raw === '' ? NaN : Number(raw) };
+    });
+    let eventToAppend;
+    try {
+      eventToAppend = buildRoundCorrectionEvent(record.events, targetSeq, replacements);
+    } catch (err) {
+      if (err instanceof DomainError) {
+        errBox.hidden = false;
+        errBox.innerHTML = err.errors.map(esc).join('<br>');
+        return;
+      }
+      throw err;
+    }
+    try {
+      await ctx.store.append(record.id, eventToAppend, record.revision);
+      renderDetail(ctx, record.id);
+      ctx.toast(`追溯补正已提交（修订号 r${record.revision + 1}），当前状态以补正后的重放结果为准`);
+    } catch (err) {
+      if (err instanceof ConflictError) {
+        renderDetail(ctx, record.id, {
+          banner: `该方案已在其他标签页或窗口更新（最新修订号 r${err.current.revision}），本次补正未写入，已为您显示最新状态。`,
+        });
+        return;
+      }
+      throw err;
+    }
   });
 }
 
