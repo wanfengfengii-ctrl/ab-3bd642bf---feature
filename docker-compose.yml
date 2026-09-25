@@ -1,0 +1,21 @@
+name: desalination-workbench
+
+services:
+  # 静态站点：宿主机端口可通过 APP_PORT 环境变量（或 .env 文件）配置
+  web:
+    build:
+      context: .
+      target: web
+    image: desalination-workbench-web
+    ports:
+      - "${APP_PORT:-8080}:80"
+    restart: unless-stopped
+
+  # 一次性验证服务：代码测试 + 构建 + 业务模块冒烟，完成后自行退出并以退出码报告结果
+  # 用法：docker compose run --rm verify
+  #   或：docker compose up --exit-code-from verify verify
+  verify:
+    build:
+      context: .
+      target: verify
+    image: desalination-workbench-verify
