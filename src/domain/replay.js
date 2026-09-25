@@ -1,5 +1,6 @@
 /**
  * 事件重放与派生状态：当前状态永远由首项记录开始重放得到，记录不可改写。
+ * 追溯补正也是追加事件：重放时将替代读数叠入原轮位置，原轮事件本身保持不变。
  * 本模块不依赖浏览器，可在 Node 中直接测试。
  */
 import { EVENT_TYPES } from './events.js';
@@ -14,7 +15,8 @@ export function replayScheme(events) {
   return state;
 }
 
-function applyEvent(state, event) {
+/** 将单条事件应用到重放状态（导出供补正重放验证逐事件推进）。 */
+export function applyEvent(state, event) {
   switch (event.type) {
     case EVENT_TYPES.SCHEME_CREATED:
       return onCreated(event);
@@ -24,6 +26,8 @@ function applyEvent(state, event) {
       return onLiquidChange(state, event);
     case EVENT_TYPES.ARTIFACT_REMOVED:
       return onRemoval(state, event);
+    case EVENT_TYPES.ROUND_CORRECTED:
+      return onRoundCorrected(state, event);
     default:
       throw new Error(`未知事件类型：${event && event.type}`);
   }
@@ -95,6 +99,32 @@ function onRemoval(state, event) {
   // 完成出槽的器物不再接受读数。
   artifact.status = 'removed';
   artifact.removedSeq = event.seq;
+  return state;
+}
+
+/**
+ * 追溯补正：将替代读数叠入原轮位置。只替换读数数值，
+ * 器物集合与采样时刻完全保持原轮不变；原轮事件与补正事件都留在日志中。
+ */
+function onRoundCorrected(state, event) {
+  const tank = findTank(state, event.tankId);
+  const round = tank.rounds.find((r) => r.seq === event.correctsSeq);
+  if (!round) throw new Error(`补正事件引用了不存在的轮次：${event.correctsSeq}`);
+  const valueOf = new Map(event.readings.map((r) => [r.artifactId, r.value]));
+  for (const r of round.readings) {
+    if (!valueOf.has(r.artifactId)) {
+      throw new Error(`补正读数与原轮器物集合不一致：${r.artifactId}`);
+    }
+  }
+  // 以新对象替换，绝不改动原事件中的读数。
+  round.readings = round.readings.map((r) => ({ ...r, value: valueOf.get(r.artifactId) }));
+  round.correctedBy = event.seq;
+  for (const artifact of tank.artifacts) {
+    if (!valueOf.has(artifact.id)) continue;
+    artifact.readings = artifact.readings.map((r) => (r.seq === event.correctsSeq
+      ? { ...r, value: valueOf.get(artifact.id), corrected: true }
+      : r));
+  }
   return state;
 }
 

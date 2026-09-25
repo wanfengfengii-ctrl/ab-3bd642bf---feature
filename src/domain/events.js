@@ -9,6 +9,7 @@ export const EVENT_TYPES = Object.freeze({
   ROUND_SUBMITTED: 'round-submitted',
   LIQUID_CHANGED: 'liquid-changed',
   ARTIFACT_REMOVED: 'artifact-removed',
+  ROUND_CORRECTED: 'round-corrected',
 });
 
 export class DomainError extends Error {

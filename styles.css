@@ -189,6 +189,26 @@ button.primary:hover:not(:disabled) { background: var(--accent-dark); }
 ol.log { margin: 8px 0 0; padding-left: 22px; font-size: 14px; }
 ol.log li { margin: 6px 0; }
 
+.link-btn {
+  border: none;
+  background: none;
+  padding: 0 2px;
+  font-size: 13px;
+  text-decoration: underline;
+}
+.link-btn:hover:not(:disabled) { background: none; color: var(--accent-dark); }
+
+.correction-form {
+  margin: 8px 0 4px;
+  padding: 10px 14px;
+  border: 1px dashed var(--accent);
+  border-radius: 8px;
+  background: #faf8f2;
+}
+.correction-form .keep-ts { align-self: end; padding-bottom: 8px; }
+
+.corrected { border-bottom: 1px dotted var(--pending); cursor: help; }
+
 .toast {
   position: fixed;
   left: 50%;

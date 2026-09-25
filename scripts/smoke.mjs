@@ -1,6 +1,7 @@
 /**
  * 业务模块冒烟：以真实领域模块 + 记录存储跑通完整业务流程。
- * 覆盖：建案 → 逐轮读数 → 资格判定 → 换液清零 → 出槽 → 陈旧修订号拒绝 → 重开还原。
+ * 覆盖：建案 → 逐轮读数 → 资格判定 → 换液清零 → 出槽 → 陈旧修订号拒绝 → 重开还原，
+ * 以及追溯补正：替代读数叠入原轮位置重放、推翻既有换液/出槽依据的补正被拒绝。
  * 任何断言失败都会以非零退出码结束。
  */
 import assert from 'node:assert/strict';
@@ -12,6 +13,7 @@ import {
   buildRemovalEvent,
   DomainError,
 } from '../src/domain/events.js';
+import { buildRoundCorrectionEvent } from '../src/domain/correction.js';
 import { replayScheme, deriveTank } from '../src/domain/replay.js';
 
 const steps = [];
@@ -114,6 +116,64 @@ function main() {
   assert.equal(tankOf(1).allSoakingEligible, true);
   assert.equal(tankOf(0).allSoakingEligible, false);
   step('多槽位资格相互独立');
+
+  // 9. 追溯补正：第 2 条记录（1 号槽第 1 周期第 1 轮，甲=300）抄错，替换为 310
+  const round2 = record.events[1];
+  assert.equal(round2.type, 'round-submitted');
+  const accepted = buildRoundCorrectionEvent(
+    record.events,
+    round2.seq,
+    round2.readings.map((r, i) => ({ artifactId: r.artifactId, value: [310, 280][i] })),
+  );
+  record = store.append(record.id, accepted, record.revision);
+  assert.equal(record.events[1].readings[0].value, 300); // 原读数不可改写
+  assert.equal(record.events[record.events.length - 1].type, 'round-corrected'); // 补正可见
+  const correctedTank = tankOf(0);
+  assert.equal(correctedTank.artifacts[0].readings[0].value, 310); // 趋势以补正后重放为准
+  assert.equal(correctedTank.artifacts[0].readings[0].ts, 1_000); // 采样时刻保持不变
+  assert.equal(correctedTank.artifacts[0].readings.length, 10); // 器物集合与读数条数不变
+  step('追溯补正叠入原轮位置重放：原读数与补正均可见，趋势一致还原');
+
+  // 10. 推翻既有处置依据的补正被拒绝，并报告最早受影响事件及原因
+  const round6 = record.events[5]; // 1 号槽第 1 周期第 5 轮 [80, 200]
+  assert.throws(
+    () => buildRoundCorrectionEvent(record.events, round6.seq, [
+      { artifactId: round6.readings[0].artifactId, value: 95 }, // 甲 80→95：换液前不再连续下降
+      { artifactId: round6.readings[1].artifactId, value: 200 },
+    ]),
+    (err) => {
+      assert.ok(err instanceof DomainError);
+      assert.ok(err.message.includes('#8'), `应报告最早受影响事件 #8（换液），实际：${err.message}`);
+      return true;
+    },
+  );
+  const round11 = record.events[10]; // 1 号槽第 2 周期第 3 轮 [90, 440]
+  assert.throws(
+    () => buildRoundCorrectionEvent(record.events, round11.seq, [
+      { artifactId: round11.readings[0].artifactId, value: 460 }, // 甲 90→460：出槽前连续下降被打断
+      { artifactId: round11.readings[1].artifactId, value: 440 },
+    ]),
+    (err) => {
+      assert.ok(err.message.includes('#13'), `应报告最早受影响事件 #13（出槽），实际：${err.message}`);
+      return true;
+    },
+  );
+  // 同一原轮至多一条有效补正
+  assert.throws(
+    () => buildRoundCorrectionEvent(
+      record.events,
+      round2.seq,
+      round2.readings.map((r) => ({ artifactId: r.artifactId, value: 320 })),
+    ),
+    (err) => err instanceof DomainError && err.errors.some((e) => e.includes('至多')),
+  );
+  // 陈旧修订号提交补正同样不得写入
+  assert.throws(
+    () => store.append(record.id, accepted, record.revision - 1),
+    ConflictError,
+  );
+  assert.equal(store.load(record.id).events.length, record.events.length);
+  step('推翻换液/出槽依据、重复补正、陈旧修订的补正均被拒绝，记录保持不变');
 
   // 9. 模拟刷新/重开：新存储实例 + 同一后端，重放还原相同过程与资格
   const reopened = createRecordStore(kv).load(record.id);

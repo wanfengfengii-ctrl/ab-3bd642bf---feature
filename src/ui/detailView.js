@@ -6,6 +6,7 @@ import {
   DomainError,
   EVENT_TYPES,
 } from '../domain/events.js';
+import { buildRoundCorrectionEvent, validateCorrection } from '../domain/correction.js';
 import { validateRound } from '../domain/validate.js';
 import { ConflictError } from '../store/recordStore.js';
 import { esc, fmtTs, toLocalInputValue } from './dom.js';
@@ -13,6 +14,8 @@ import { esc, fmtTs, toLocalInputValue } from './dom.js';
 /**
  * 方案详情页：每槽本轮趋势、下一步资格、修订号、自首项记录重放的不可改写过程。
  * 所有变更操作均以渲染时所见的修订号提交；发生冲突时拒绝写入并展示最新状态。
+ * 对已提交的整轮读数可在过程记录中提出追溯补正：仅替换读数，
+ * 器物集合与采样时刻保持不变；补正叠入原轮位置重放并重新验证其后全部记录。
  */
 export function renderDetail(ctx, schemeId, options = {}) {
   const { store, root } = ctx;
@@ -37,7 +40,7 @@ export function renderDetail(ctx, schemeId, options = {}) {
     ${tanks.map((tank) => tankCardHtml(tank)).join('')}
     <section class="panel">
       <h3>过程记录（自首项记录重放 · 不可改写）</h3>
-      <ol class="log">${record.events.map((ev) => `<li>${renderEvent(ev, state)}</li>`).join('')}</ol>
+      <ol class="log">${record.events.map((ev) => `<li>${renderEvent(ev, state, record.events, options)}</li>`).join('')}</ol>
     </section>`;
 
   bindDetail(ctx, record, tanks);
@@ -62,7 +65,9 @@ function tankCardHtml(tank) {
 
 function artifactRowHtml(tank, a) {
   const trend = a.periodReadings.length > 0
-    ? a.periodReadings.map((r) => r.value).join(' → ')
+    ? a.periodReadings.map((r) => (r.corrected
+      ? `<span class="corrected" title="该轮读数已经追溯补正">${r.value}✎</span>`
+      : String(r.value))).join(' → ')
     : '—';
   const lastOk = a.lastValue != null && a.lastValue <= tank.limit;
   return `<tr>
@@ -133,8 +138,9 @@ function roundFormHtml(tank) {
   </form>`;
 }
 
-function renderEvent(ev, state) {
+function renderEvent(ev, state, events, options = {}) {
   const time = fmtTs(Date.parse(ev.at));
+  const nameOf = artifactNamer(state, ev.tankId);
   switch (ev.type) {
     case EVENT_TYPES.SCHEME_CREATED: {
       const tanks = ev.tanks.map((t) => `槽「${esc(t.name)}」（上限 ${t.limit} µS/cm，需连续 ${t.requiredRounds} 轮，${t.artifacts.length} 件器物：${t.artifacts.map((a) => esc(a.name)).join('、')}）`).join('；');
@@ -142,27 +148,72 @@ function renderEvent(ev, state) {
     }
     case EVENT_TYPES.ROUND_SUBMITTED: {
       const tank = state.tanks.find((t) => t.id === ev.tankId);
-      const nameOf = (id) => {
-        const found = tank && tank.artifacts.find((a) => a.id === id);
-        return found ? found.name : id;
-      };
       const readings = ev.readings
         .map((r) => `${esc(nameOf(r.artifactId))}=${r.value} µS/cm @ ${fmtTs(r.ts)}`)
         .join('，');
-      return `<strong>#${ev.seq}</strong> <span class="muted">${time}</span> 槽「${esc(tank ? tank.name : ev.tankId)}」第 ${ev.period + 1} 周期第 ${ev.roundInPeriod} 轮读数：${readings}`;
+      const correction = events.find((e) => e.type === EVENT_TYPES.ROUND_CORRECTED && e.correctsSeq === ev.seq);
+      const note = correction
+        ? ` <span class="badge pending">已被 #${correction.seq} 追溯补正，当前以补正后重放为准</span>`
+        : '';
+      const action = correction
+        ? ''
+        : options.correctingSeq === ev.seq
+          ? correctionFormHtml(ev, nameOf)
+          : ` <button type="button" class="link-btn" data-action="correct" data-seq="${ev.seq}" title="该轮读数抄错时提出替代读数；器物集合与采样时刻保持不变">补正本轮</button>`;
+      return `<strong>#${ev.seq}</strong> <span class="muted">${time}</span> 槽「${esc(tank ? tank.name : ev.tankId)}」第 ${ev.period + 1} 周期第 ${ev.roundInPeriod} 轮读数：${readings}${note}${action}`;
+    }
+    case EVENT_TYPES.ROUND_CORRECTED: {
+      const tank = state.tanks.find((t) => t.id === ev.tankId);
+      const target = events.find((e) => e.seq === ev.correctsSeq);
+      const changes = ev.readings
+        .map((r) => {
+          const orig = target && target.readings.find((o) => o.artifactId === r.artifactId);
+          return `${esc(nameOf(r.artifactId))}=${r.value} µS/cm（原 ${orig ? orig.value : '?'}）`;
+        })
+        .join('，');
+      return `<strong>#${ev.seq}</strong> <span class="muted">${time}</span> 追溯补正第 #${ev.correctsSeq} 条（槽「${esc(tank ? tank.name : ev.tankId)}」）：${changes}；器物集合与采样时刻沿用原轮`;
     }
     case EVENT_TYPES.LIQUID_CHANGED: {
       const tank = state.tanks.find((t) => t.id === ev.tankId);
       return `<strong>#${ev.seq}</strong> <span class="muted">${time}</span> 槽「${esc(tank ? tank.name : ev.tankId)}」执行换液，该槽轮次清零`;
     }
     case EVENT_TYPES.ARTIFACT_REMOVED: {
-      const tank = state.tanks.find((t) => t.id === ev.tankId);
-      const artifact = tank && tank.artifacts.find((a) => a.id === ev.artifactId);
-      return `<strong>#${ev.seq}</strong> <span class="muted">${time}</span> 器物「${esc(artifact ? artifact.name : ev.artifactId)}」完成出槽，不再接受读数`;
+      return `<strong>#${ev.seq}</strong> <span class="muted">${time}</span> 器物「${esc(nameOf(ev.artifactId))}」完成出槽，不再接受读数`;
     }
     default:
       return `<strong>#${ev.seq}</strong> <span class="muted">${time}</span> 未知事件`;
   }
+}
+
+/** 由重放状态解析器物名称（跨槽查找，供过程记录展示）。 */
+function artifactNamer(state, tankId) {
+  const tank = state.tanks.find((t) => t.id === tankId);
+  return (artifactId) => {
+    const found = tank && tank.artifacts.find((a) => a.id === artifactId);
+    return found ? found.name : artifactId;
+  };
+}
+
+/** 追溯补正表单：仅可替换读数；器物集合与采样时刻完全沿用原轮。 */
+function correctionFormHtml(ev, nameOf) {
+  const rows = ev.readings.map((r) => `
+    <div class="reading-row" data-artifact="${r.artifactId}">
+      <span class="reading-name">${esc(nameOf(r.artifactId))}</span>
+      <label>替代读数（整数 µS/cm）
+        <input type="number" min="0" step="1" required data-field="value" value="${r.value}">
+      </label>
+      <span class="muted keep-ts">采样时刻沿用原轮：${fmtTs(r.ts)}</span>
+    </div>`).join('');
+  return `<form class="correction-form" data-seq="${ev.seq}" novalidate>
+    <h4>追溯补正第 #${ev.seq} 条读数</h4>
+    <p class="muted">仅可替换读数，器物集合与采样时刻保持不变。提交后替代读数将叠入原轮位置自首项记录重放，并重新验证其后每次读数、换液与出槽；若推翻既有处置依据将被拒绝。</p>
+    ${rows}
+    <div class="errors" hidden></div>
+    <div class="actions">
+      <button type="submit" class="primary">提交补正</button>
+      <button type="button" data-action="cancel-correction">取消</button>
+    </div>
+  </form>`;
 }
 
 function bindDetail(ctx, record, tanks) {
@@ -207,16 +258,56 @@ function bindDetail(ctx, record, tanks) {
       await mutate(ctx, record, () => buildRemovalEvent(tank, btn.dataset.artifact), '器物已出槽');
     });
   });
+
+  // 打开某一轮的追溯补正表单（同一时刻只展开一轮）。
+  root.querySelectorAll('button[data-action="correct"]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      renderDetail(ctx, record.id, { correctingSeq: Number(btn.dataset.seq) });
+    });
+  });
+
+  root.querySelectorAll('button[data-action="cancel-correction"]').forEach((btn) => {
+    btn.addEventListener('click', () => renderDetail(ctx, record.id));
+  });
+
+  root.querySelectorAll('form.correction-form').forEach((form) => {
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const targetSeq = Number(form.dataset.seq);
+      const errBox = form.querySelector('.errors');
+      const readings = [...form.querySelectorAll('.reading-row')].map((row) => {
+        const valueRaw = row.querySelector('[data-field="value"]').value;
+        return { artifactId: row.dataset.artifact, value: valueRaw === '' ? NaN : Number(valueRaw) };
+      });
+      const errors = validateCorrection(record.events, targetSeq, readings);
+      if (errors.length > 0) {
+        errBox.hidden = false;
+        errBox.innerHTML = errors.map(esc).join('<br>');
+        return;
+      }
+      errBox.hidden = true;
+      await mutate(
+        ctx,
+        record,
+        () => buildRoundCorrectionEvent(record.events, targetSeq, readings),
+        '补正已提交，当前状态已按补正后重放还原',
+        { correctingSeq: targetSeq },
+      );
+    });
+  });
 }
 
-/** 以所见修订号提交事件；陈旧操作不得写入，并展示最新状态。 */
-async function mutate(ctx, record, buildEvent, successMessage) {
+/**
+ * 以所见修订号提交事件；陈旧操作不得写入，并展示最新状态。
+ * renderOptions 用于领域校验失败时保持原操作上下文（如补正表单保持展开）。
+ */
+async function mutate(ctx, record, buildEvent, successMessage, renderOptions = {}) {
   let event;
   try {
     event = buildEvent();
   } catch (err) {
     if (err instanceof DomainError) {
-      renderDetail(ctx, record.id, { banner: err.errors.join('；') });
+      renderDetail(ctx, record.id, { ...renderOptions, banner: err.errors.join('；') });
       return;
     }
     throw err;
